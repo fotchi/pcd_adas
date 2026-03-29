@@ -1,0 +1,22 @@
+# Catkin build and development directories
+build/
+devel/
+install/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+*.egg
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
