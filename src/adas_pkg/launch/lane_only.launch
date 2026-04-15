@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <!-- Lane Detection Node — source: /carla/camera/rgb publiée par carla_adas_world.py -->
+  <node pkg="adas_pkg" type="lane_detection_node.py" name="lane_detection_node" output="screen">
+    <param name="roi_top_ratio"    value="0.55"/>
+    <param name="canny_low"        value="50"/>
+    <param name="canny_high"       value="150"/>
+    <param name="hough_threshold"  value="25"/>
+    <param name="min_line_length"  value="40"/>
+    <param name="max_line_gap"     value="20"/>
+    <param name="slope_threshold"  value="0.3"/>
+  </node>
+
+  <!-- Lane Viewer — fenêtre OpenCV côte à côte (RGB + masque) -->
+  <node pkg="adas_pkg" type="lane_viewer_node.py" name="lane_viewer_node" output="screen"/>
+</launch>
