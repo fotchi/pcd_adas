@@ -1,479 +1,573 @@
 #!/usr/bin/env python3
 """
-Object Detection Node — YOLOv5 Integration
+object_detection_node.py — Détection temps réel (bestobject.pt uniquement)
 
-Autonomous driving perception node for real-time object detection using YOLOv5.
-Integrates with CARLA simulator via ROS topics.
+Classes actives (bestobject.pt) :
+  Véhicules : person(0) car(1) truck(2) bus(3) motorcycle(4)
+  Feux      : red light(5) green light(6)
+  Panneaux  : stop sign(7) speed limit 20-120 (10-18)
 
-Subscriptions:
-    - /carla/camera/rgb (sensor_msgs/Image): Camera feed from CARLA
+Seuils séparés par catégorie pour compenser le domain gap CARLA.
 
-Publications:
-    - /adas/detection (std_msgs/String): CSV list of detected objects
-    - /adas/detection_image (sensor_msgs/Image): Annotated detection visualization
-
-Parameters:
-    - ~model_path (str): Path to custom YOLOv5 .pt model. If not provided or invalid,
-                        uses default YOLOv5s model
-    - ~confidence_threshold (float): Detection confidence threshold [0.0-1.0]
-    - ~inference_size (int): Input inference size in pixels
-    - ~enabled_classes (list): List of COCO class indices to detect
-
-Author: ADAS Development Team
-License: MIT
+Publie :
+  /adas/detection        (String)  — pipe-separated: class:detail:conf:x1:y1:x2:y2
+  /adas/detection_image  (Image)   — frame annotée
+Souscrit :
+  /carla/camera/rgb      (Image)
 """
 
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
+import threading
+import time
 import cv2
 import numpy as np
 import rospy
-from cv_bridge import CvBridge, CvBridgeError
+from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-# ============================================================================
-# Constants & Configuration
-# ============================================================================
+_SRC_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(_SRC_DIR, 'bestobject.pt')
 
-@dataclass
-class DetectionConfig:
-    """Configuration for object detection"""
-    # Model parameters
-    DEFAULT_MODEL: str = 'yolov5s'
-    CONFIDENCE_THRESHOLD: float = 0.45
-    INFERENCE_SIZE: int = 416
-    DEVICE: str = 'auto'
-    
-    # Enabled COCO classes
-    # 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck, 9=traffic_light, 11=stop_sign
-    ENABLED_CLASSES: List[int] = None
-    
-    # Color map for visualization (BGR format)
-    CLASS_COLORS: Dict[str, Tuple[int, int, int]] = None
-    
-    # ROS topic names
-    CAMERA_TOPIC: str = '/carla/camera/rgb'
-    DETECTION_PUB_TOPIC: str = '/adas/detection'
-    IMAGE_PUB_TOPIC: str = '/adas/detection_image'
-    
-    # Publisher queue sizes
-    QUEUE_SIZE: int = 1
-    
-    # Logging
-    LOG_THROTTLE: float = 1.0  # seconds
-    
-    def __post_init__(self):
-        if self.ENABLED_CLASSES is None:
-            self.ENABLED_CLASSES = [0, 1, 2, 3, 5, 7, 9, 11]
-        if self.CLASS_COLORS is None:
-            self.CLASS_COLORS = {
-                'person': (0, 0, 255),          # Red
-                'bicycle': (0, 255, 0),         # Green
-                'car': (255, 165, 0),           # Orange
-                'motorcycle': (0, 165, 255),    # Orange-Red
-                'bus': (255, 165, 0),           # Orange
-                'truck': (255, 165, 0),         # Orange
-                'traffic light': (0, 255, 255), # Yellow
-                'stop sign': (0, 0, 200),       # Dark Red
-                'unknown': (128, 128, 128),     # Gray
-            }
+INFER_SIZE = 640
 
+# Seuils par catégorie
+CONF_VEHICLES = 0.05   # un peu plus sensible pour récupérer car/pieton
+CONF_LIGHTS   = 0.25   # plus sensible pour récupérer les feux CARLA
+CONF_SIGNS    = 0.06   # panneaux stop/vitesse
+CONF_SPEED_SIGNS = 0.30  # plus strict pour limiter les faux panneaux vitesse
 
-# ============================================================================
-# Object Detection Node
-# ============================================================================
+LIGHT_MIN_AREA = 140   # px² — plus permissif pour feux lointains
+LIGHT_MAX_KEEP = 3     # max N feux par frame
+SIGN_MIN_AREA  = 450   # px² — filtre des petits faux positifs
+SIGN_MIN_AR    = 0.65  # ratio w/h minimal attendu
+SIGN_MAX_AR    = 1.35  # ratio w/h maximal attendu
+
+DEDUP_IOU_THRESH = 0.55   # suppression de doublons bbox
+MAX_VEH_KEEP     = 20     # max véhicules publiés par frame
+MAX_SIGN_KEEP    = 6      # max panneaux publiés par frame
+STICKY_HOLD_SEC  = 1.20   # maintien un peu plus long pour feux/panneaux
+LOG_DET_EVERY_SEC = 1.0   # cadence d'affichage terminal
+LOG_NONE          = True  # afficher aussi 'none' pour diagnostiquer le flux
+USE_CLASS_FILTER  = True  # filtrer sur classes utiles du modèle
+
+# IDs par catégorie
+VEHICLE_IDS = {0, 1, 2, 3, 4}   # person car truck bus motorcycle
+LIGHT_IDS   = {5, 6}             # red light, green light
+SIGN_IDS    = {7, 10, 11, 12, 13, 14, 15, 16, 17, 18}  # stop + speed limits
+
+ALL_ACTIVE  = list(VEHICLE_IDS | LIGHT_IDS | SIGN_IDS)
+
+LABEL_MAP = {
+    'person':        'pieton',
+    'pedestrian':    'pieton',
+    'walker':        'pieton',
+    'car':           'voiture',
+    'vehicle':       'voiture',
+    'truck':         'camion',
+    'bus':           'bus',
+    'motorcycle':    'moto',
+    'motorbike':     'moto',
+    'red light':     'feu_rouge',
+    'green light':   'feu_vert',
+    'stop sign':     'stop',
+    'turn right':    'droite',
+    'right turn':    'droite',
+    'mandatory right': 'droite',
+    'turn left':     'gauche',
+    'left turn':     'gauche',
+    'mandatory left': 'gauche',
+    'speed limit 20':  'vitesse',
+    'speed limit 30':  'vitesse',
+    'speed limit 40':  'vitesse',
+    'speed limit 50':  'vitesse',
+    'speed limit 60':  'vitesse',
+    'speed limit 70':  'vitesse',
+    'speed limit 80':  'vitesse',
+    'speed limit 100': 'vitesse',
+    'speed limit 120': 'vitesse',
+}
+
+BOX_COLORS = {
+    'pieton':    (0,   0,   255),
+    'voiture':   (255, 140, 0),
+    'camion':    (255, 60,  0),
+    'bus':       (255, 100, 0),
+    'moto':      (255, 100, 0),
+    'feu_rouge': (0,   0,   255),
+    'feu_vert':  (0,   255, 0),
+    'stop':      (0,   0,   200),
+    'vitesse':   (200, 0,   200),
+    'default':   (128, 128, 128),
+}
+
 
 class ObjectDetectionNode:
-    """
-    YOLOv5-based object detection node for autonomous driving perception.
-    
-    Handles:
-    - Model loading (custom or default)
-    - Camera frame processing
-    - Real-time object detection
-    - Visualization with bounding boxes
-    - Publication of results
-    """
-    
-    # Throttle intervals for logging (seconds)
-    LOG_THROTTLE_INTERVAL = 1.0
-    ERROR_LOG_THROTTLE = 5.0
-    
+
     def __init__(self):
-        """Initialize the Object Detection Node"""
-        # Initialize ROS node
         rospy.init_node('object_detection_node', anonymous=False)
-        
-        # Load configuration
-        self.config = self._load_config()
-        
-        # Initialize components
-        self.bridge = CvBridge()
-        self.model = None
-        self.model_loaded = False
-        self.device = 'cpu'
-        self._last_log_time = {}
-        
-        # Load model
+        self._bridge = CvBridge()
+        self._lock   = threading.Lock()
+        self._frame  = None
+        self._model  = None
+        self._torch  = None
+        self._names  = {}
+        self._vehicle_ids = set(VEHICLE_IDS)
+        self._light_ids   = set(LIGHT_IDS)
+        self._sign_ids    = set(SIGN_IDS)
+        self._all_active  = list(ALL_ACTIVE)
+        self._sticky_until = {}
+        self._sticky_det   = {}
+
+        # Paramètres runtime (tuning sans modifier le code)
+        self._model_path         = rospy.get_param('~model_path', MODEL_PATH)
+        self._infer_size         = int(rospy.get_param('~infer_size', INFER_SIZE))
+        self._conf_vehicles      = float(rospy.get_param('~conf_vehicles', CONF_VEHICLES))
+        self._conf_lights        = float(rospy.get_param('~conf_lights', CONF_LIGHTS))
+        self._conf_signs         = float(rospy.get_param('~conf_signs', CONF_SIGNS))
+        self._conf_speed_signs   = float(rospy.get_param('~conf_speed_signs', CONF_SPEED_SIGNS))
+        self._light_min_area     = int(rospy.get_param('~light_min_area', LIGHT_MIN_AREA))
+        self._light_max_keep     = int(rospy.get_param('~light_max_keep', LIGHT_MAX_KEEP))
+        self._sign_min_area      = int(rospy.get_param('~sign_min_area', SIGN_MIN_AREA))
+        self._sign_min_ar        = float(rospy.get_param('~sign_min_ar', SIGN_MIN_AR))
+        self._sign_max_ar        = float(rospy.get_param('~sign_max_ar', SIGN_MAX_AR))
+        self._dedup_iou_thresh   = float(rospy.get_param('~dedup_iou_thresh', DEDUP_IOU_THRESH))
+        self._max_veh_keep       = int(rospy.get_param('~max_vehicle_keep', MAX_VEH_KEEP))
+        self._max_sign_keep      = int(rospy.get_param('~max_sign_keep', MAX_SIGN_KEEP))
+        self._sticky_hold_sec    = float(rospy.get_param('~sticky_hold_sec', STICKY_HOLD_SEC))
+        self._use_class_filter   = bool(rospy.get_param('~use_class_filter', USE_CLASS_FILTER))
+        self._enable_visual      = bool(rospy.get_param('~enable_visualization', True))
+        self._publish_image      = bool(rospy.get_param('~publish_image', True))
+        self._loop_hz            = float(rospy.get_param('~loop_hz', 60.0))
+        self._log_det_every_sec  = float(rospy.get_param('~log_det_every_sec', LOG_DET_EVERY_SEC))
+        self._log_none           = bool(rospy.get_param('~log_none', LOG_NONE))
+
+        self._model_path = self._resolve_model_path(self._model_path)
+
+        # Frame d'attente réutilisée pour éviter des allocations inutiles
+        self._wait_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(self._wait_frame,
+                    'En attente /carla/camera/rgb ...',
+                    (30, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, (80, 200, 80), 2, cv2.LINE_AA)
+
         self._load_model()
-        
-        # Initialize publishers
-        self.pub_detection = rospy.Publisher(
-            self.config.DETECTION_PUB_TOPIC,
-            String,
-            queue_size=self.config.QUEUE_SIZE
-        )
-        self.pub_detection_image = rospy.Publisher(
-            self.config.IMAGE_PUB_TOPIC,
-            Image,
-            queue_size=self.config.QUEUE_SIZE
-        )
-        
-        # Initialize subscriber
-        self.sub_camera = rospy.Subscriber(
-            self.config.CAMERA_TOPIC,
-            Image,
-            self._camera_callback,
-            queue_size=1,
-            buff_size=52428800  # 50MB buffer for high-res images
-        )
-        
-        rospy.loginfo(f"✅ Object Detection Node initialized successfully")
-        rospy.loginfo(f"   Camera topic: {self.config.CAMERA_TOPIC}")
-        rospy.loginfo(f"   Detection topic: {self.config.DETECTION_PUB_TOPIC}")
-        rospy.loginfo(f"   Visualization topic: {self.config.IMAGE_PUB_TOPIC}")
-    
-    @staticmethod
-    def _load_config() -> DetectionConfig:
-        """
-        Load configuration from ROS parameters and defaults.
-        
-        Returns:
-            DetectionConfig: Configuration object
-        """
-        config = DetectionConfig()
-        
-        # Override defaults with ROS parameters
-        config.CONFIDENCE_THRESHOLD = rospy.get_param(
-            '~confidence_threshold',
-            config.CONFIDENCE_THRESHOLD
-        )
-        config.INFERENCE_SIZE = rospy.get_param(
-            '~inference_size',
-            config.INFERENCE_SIZE
-        )
-        config.ENABLED_CLASSES = rospy.get_param(
-            '~enabled_classes',
-            config.ENABLED_CLASSES
-        )
-        config.DEVICE = rospy.get_param('~device', config.DEVICE)
+        self._pub_det = rospy.Publisher('/adas/detection',       String, queue_size=1)
+        self._pub_img = rospy.Publisher('/adas/detection_image', Image, queue_size=1) if self._publish_image else None
+        rospy.Subscriber('/carla/camera/rgb', Image, self._cb_frame,
+                         queue_size=1, buff_size=52428800)
+        rospy.loginfo("Object Detection Node prêt")
 
-        config.CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(config.CONFIDENCE_THRESHOLD)))
-        config.INFERENCE_SIZE = max(160, int(config.INFERENCE_SIZE))
-        
-        rospy.loginfo(f"Configuration loaded:")
-        rospy.loginfo(f"  Confidence threshold: {config.CONFIDENCE_THRESHOLD}")
-        rospy.loginfo(f"  Inference size: {config.INFERENCE_SIZE}x{config.INFERENCE_SIZE}")
-        rospy.loginfo(f"  Enabled classes: {config.ENABLED_CLASSES}")
-        
-        return config
+    def _resolve_model_path(self, candidate_path):
+        """Privilégie bestobject.pt et fournit un fallback robuste."""
+        requested = str(candidate_path).strip() if candidate_path is not None else ''
+        candidates = []
+        if requested:
+            candidates.append(requested)
+        if MODEL_PATH not in candidates:
+            candidates.append(MODEL_PATH)
 
-    def _load_model(self) -> bool:
-        """
-        Load YOLOv5 model from custom path or default.
-        
-        Tries to load a custom model specified via ROS parameter.
-        Falls back to default YOLOv5s model if custom path is invalid.
-        
-        Returns:
-            bool: True if model loaded successfully, False otherwise
-        """
+        for p in candidates:
+            if os.path.exists(p):
+                if os.path.basename(p).lower() != 'bestobject.pt':
+                    rospy.logwarn(f"[OBJ] Modèle non standard sélectionné: {p} (recommandé: bestobject.pt)")
+                return p
+
+        # Conserver la demande utilisateur pour un message d'erreur explicite ensuite.
+        return requested if requested else MODEL_PATH
+
+    def _load_model(self):
+        if not os.path.exists(self._model_path):
+            rospy.logerr(f"[OBJ] Modèle introuvable: {self._model_path}")
+            return
         try:
-            import torch # pyright: ignore[reportMissingImports]
-            self._select_device(torch)
-            
-            model_path = rospy.get_param('~model_path', None)
-            
-            # Attempt to load custom model
-            if model_path and os.path.exists(model_path):
-                rospy.loginfo(f"Loading custom model from: {model_path}")
-                try:
-                    self.model = torch.hub.load(
-                        'ultralytics/yolov5',
-                        'custom',
-                        path=model_path,
-                        force_reload=False
-                    )
-                    self._configure_model()
-                    rospy.loginfo(f"✅ Custom model loaded successfully")
-                    self.model_loaded = True
-                    return True
-                except Exception as e:
-                    rospy.logwarn(f"Failed to load custom model: {e}")
-                    rospy.logwarn(f"Falling back to default YOLOv5s model")
-            
-            # Load default model
-            rospy.loginfo(f"Loading default YOLOv5s model...")
-            self.model = torch.hub.load(
-                'ultralytics/yolov5',
-                self.config.DEFAULT_MODEL,
-                pretrained=True,
-                force_reload=False
-            )
-
-            self._configure_model()
-            
-            rospy.loginfo(f"✅ YOLOv5 model loaded successfully")
-            self.model_loaded = True
-            return True
-            
-        except ImportError as e:
-            rospy.logerr(f"PyTorch not installed: {e}")
-            rospy.logerr(f"Install with: pip3 install torch torchvision")
-            return False
+            import torch
+            self._torch = torch
+        except ImportError:
+            rospy.logerr("PyTorch non installé")
+            return
+        try:
+            from ultralytics import YOLO
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if device == 'cuda':
+                torch.backends.cudnn.benchmark = True
+            self._model = YOLO(self._model_path)
+            self._model.to(device)
+            try:
+                self._model.fuse()
+            except Exception:
+                # Le fuse n'est pas disponible/utile pour tous les backends
+                pass
+            self._names = self._model.names
+            self._configure_class_groups()
+            rospy.loginfo(f"[OBJ] Modèle chargé ({device}) : {self._model_path}")
         except Exception as e:
-            rospy.logerr(f"Failed to load model: {e}")
-            rospy.logerr(f"Model loading error details: {type(e).__name__}: {str(e)}")
-            return False
+            rospy.logerr(f"[OBJ] Chargement échoué : {e}")
 
-    def _select_device(self, torch) -> None:
-        device_param = str(self.config.DEVICE).lower()
-        if device_param in ('auto', 'cuda') and torch.cuda.is_available():
-            self.device = 'cuda:0'
+    def _configure_class_groups(self):
+        # Adapte les groupes à la nomenclature réelle du modèle pour éviter
+        # les faux filtres quand les IDs changent entre checkpoints.
+        if isinstance(self._names, dict):
+            id_to_name = {int(k): str(v).lower() for k, v in self._names.items()}
+        elif isinstance(self._names, (list, tuple)):
+            id_to_name = {i: str(v).lower() for i, v in enumerate(self._names)}
         else:
-            self.device = 'cpu'
+            id_to_name = {}
 
-    def _configure_model(self) -> None:
-        if self.model is None:
+        if not id_to_name:
+            self._vehicle_ids = set(VEHICLE_IDS)
+            self._light_ids = set(LIGHT_IDS)
+            self._sign_ids = set(SIGN_IDS)
+            self._all_active = list(self._vehicle_ids | self._light_ids | self._sign_ids)
+            rospy.logwarn("[OBJ] Noms de classes indisponibles, fallback IDs par défaut")
             return
-        if hasattr(self.model, 'to'):
-            self.model.to(self.device)
-        if hasattr(self.model, 'conf'):
-            self.model.conf = self.config.CONFIDENCE_THRESHOLD
-        if hasattr(self.model, 'classes'):
-            self.model.classes = self.config.ENABLED_CLASSES
-    
-    def _camera_callback(self, msg: Image) -> None:
-        """
-        Process incoming camera frame and perform object detection.
-        
-        Args:
-            msg (sensor_msgs/Image): Camera frame message
-        """
-        # Skip if model not loaded
-        if not self.model_loaded or self.model is None:
-            return
-        
-        try:
-            # Convert ROS image message to OpenCV format
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except CvBridgeError as e:
-            self._log_throttled('cv_bridge_error', f"CvBridge error: {e}", level='error')
-            return
-        except Exception as e:
-            self._log_throttled('frame_error', f"Frame processing error: {e}", level='error')
-            return
-        
-        # Perform detection and publish results
-        try:
-            detections_df = self._run_inference(frame)
-            detections_list = self._extract_labels(detections_df)
-            annotated_frame = self._annotate_frame(frame, detections_df)
 
-            # Publish results
-            self._publish_results(detections_list, annotated_frame)
+        available = set(id_to_name.keys())
+        default_vehicle = set(VEHICLE_IDS) & available
+        default_light = set(LIGHT_IDS) & available
+        default_sign = set(SIGN_IDS) & available
 
-            # Log detections
-            if detections_list:
-                det_str = ', '.join(detections_list)
-                self._log_throttled('detection', f"Detected: {det_str}", level='info')
+        detected_vehicle = set()
+        detected_light = set()
+        detected_sign = set()
 
-        except Exception as e:
-            self._log_throttled('detection_error', f"Detection error: {e}", level='error')
-    
-    def _run_inference(self, frame: np.ndarray):
-        """
-        Run YOLOv5 inference and return detections dataframe.
+        for cls_id, n in id_to_name.items():
+            if any(k in n for k in ('person', 'pedestrian', 'car', 'truck', 'bus', 'motorcycle', 'motorbike')):
+                detected_vehicle.add(cls_id)
+            if ('red' in n and 'light' in n) or ('green' in n and 'light' in n):
+                detected_light.add(cls_id)
+            if (('stop' in n and 'sign' in n)
+                    or ('speed' in n and 'limit' in n)
+                    or ('turn' in n and ('left' in n or 'right' in n))
+                    or ('mandatory' in n and ('left' in n or 'right' in n))):
+                detected_sign.add(cls_id)
 
-        Args:
-            frame (np.ndarray): Input image (BGR format)
+        self._vehicle_ids = detected_vehicle if detected_vehicle else default_vehicle
+        self._light_ids = detected_light if detected_light else default_light
+        self._sign_ids = detected_sign if detected_sign else default_sign
 
-        Returns:
-            pandas.DataFrame or None: Detection dataframe with bbox/labels
-        """
-        try:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.model(rgb_frame, size=self.config.INFERENCE_SIZE)
+        # Si vraiment rien n'est trouvé, ne pas bloquer l'inférence par un filtre vide
+        self._all_active = sorted(self._vehicle_ids | self._light_ids | self._sign_ids)
+        rospy.loginfo(f"[OBJ] IDs classes -> veh:{sorted(self._vehicle_ids)} light:{sorted(self._light_ids)} sign:{sorted(self._sign_ids)}")
 
-            if len(results) > 0 and hasattr(results, 'pandas'):
-                return results.pandas().xyxy[0]
-        except Exception as e:
-            self._log_throttled('inference_error', f"Inference error: {e}", level='error')
-
+    def _category_from_name(self, name):
+        n = str(name).lower().strip()
+        if any(k in n for k in ('person', 'pedestrian', 'walker', 'car', 'vehicle', 'truck', 'bus', 'motorcycle', 'motorbike')):
+            return 'vehicle'
+        if ('red' in n and 'light' in n) or ('green' in n and 'light' in n):
+            return 'light'
+        if (('stop' in n and 'sign' in n)
+                or ('speed' in n and 'limit' in n)
+                or ('turn' in n and ('left' in n or 'right' in n))
+                or ('mandatory' in n and ('left' in n or 'right' in n))):
+            return 'sign'
         return None
 
-    @staticmethod
-    def _extract_labels(detections_df) -> List[str]:
-        """
-        Extract labels from detection dataframe.
+    def _class_name(self, cls_id):
+        # Certains modèles renvoient names en list, dict[int->str] ou dict[str->str]
+        if isinstance(self._names, dict):
+            if cls_id in self._names:
+                return str(self._names[cls_id])
+            key = str(cls_id)
+            if key in self._names:
+                return str(self._names[key])
+            return str(cls_id)
+        if isinstance(self._names, (list, tuple)) and 0 <= cls_id < len(self._names):
+            return str(self._names[cls_id])
+        return str(cls_id)
 
-        Args:
-            detections_df: YOLOv5 detection dataframe
+    def _category(self, cls_id, name):
+        by_name = self._category_from_name(name)
+        if by_name is not None:
+            return by_name
+        # Fallback via IDs détectés au chargement du modèle
+        if cls_id in self._vehicle_ids:
+            return 'vehicle'
+        if cls_id in self._light_ids:
+            return 'light'
+        if cls_id in self._sign_ids:
+            return 'sign'
+        return None
 
-        Returns:
-            List[str]: List of detected labels
-        """
-        if detections_df is None or len(detections_df) == 0:
-            return []
-        return detections_df['name'].tolist()
-    
-    def _annotate_frame(
-        self,
-        frame: np.ndarray,
-        detections_df
-    ) -> np.ndarray:
-        """
-        Add bounding boxes and labels to frame using model results.
-        
-        Args:
-            frame (np.ndarray): Input image (BGR format)
-            detections_df: YOLOv5 detection dataframe
-        
-        Returns:
-            np.ndarray: Annotated image
-        """
-        annotated = frame.copy()
-        
+    def _cb_frame(self, msg):
         try:
-            if detections_df is not None and len(detections_df) > 0:
-                for _, row in detections_df.iterrows():
-                    x1, y1 = int(row['xmin']), int(row['ymin'])
-                    x2, y2 = int(row['xmax']), int(row['ymax'])
-                    label = str(row['name'])
-                    confidence = float(row['confidence'])
-
-                    color = self.config.CLASS_COLORS.get(
-                        label,
-                        self.config.CLASS_COLORS['unknown']
-                    )
-
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-                    label_text = f"{label} {confidence:.2f}"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.5
-                    thickness = 1
-
-                    text_size = cv2.getTextSize(label_text, font, font_scale, thickness)[0]
-                    text_x, text_y = x1, max(y1 - 5, text_size[1])
-
-                    cv2.rectangle(
-                        annotated,
-                        (text_x, text_y - text_size[1] - 4),
-                        (text_x + text_size[0] + 4, text_y + 2),
-                        color,
-                        -1
-                    )
-
-                    cv2.putText(
-                        annotated,
-                        label_text,
-                        (text_x + 2, text_y - 2),
-                        font,
-                        font_scale,
-                        (255, 255, 255),
-                        thickness
-                    )
-        
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            with self._lock:
+                self._frame = frame
         except Exception as e:
-            self._log_throttled('annotation_error', f"Annotation error: {e}", level='error')
-        
-        return annotated
-    
-    def _publish_results(
-        self,
-        detections: List[str],
-        annotated_frame: np.ndarray
-    ) -> None:
-        """
-        Publish detection results and visualization.
-        
-        Args:
-            detections (List[str]): List of detected object labels
-            annotated_frame (np.ndarray): Annotated image for visualization
-        """
-        # Publish detection list
+            rospy.logwarn_throttle(5, f"[OBJ] Erreur réception image: {e}")
+
+    def run(self):
+        if self._enable_visual:
+            cv2.namedWindow('Object Detection', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Object Detection', 860, 490)
+
+        rate = rospy.Rate(self._loop_hz if self._loop_hz > 0 else 60.0)
+        prev_t = time.time()
+
+        while not rospy.is_shutdown():
+            with self._lock:
+                frame = self._frame.copy() if self._frame is not None else None
+
+            if frame is not None and self._model is not None:
+                now    = time.time()
+                fps    = 1.0 / max(now - prev_t, 1e-6)
+                prev_t = now
+                annotated, dets = self._process(frame, draw=self._enable_visual)
+                if self._enable_visual and annotated is not None:
+                    cv2.rectangle(annotated, (0, 0), (frame.shape[1], 26), (10, 10, 10), -1)
+                    cv2.putText(annotated, f'FPS:{fps:.0f}  Objets:{len(dets)}',
+                                (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (200, 200, 200), 1, cv2.LINE_AA)
+                    cv2.imshow('Object Detection', annotated)
+            else:
+                if self._enable_visual:
+                    wait = self._wait_frame.copy()
+                    if self._model is None:
+                        cv2.rectangle(wait, (0, 0), (640, 26), (10, 10, 10), -1)
+                        cv2.putText(wait, 'Chargement modele ...',
+                                    (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.55, (200, 200, 200), 1, cv2.LINE_AA)
+                    cv2.imshow('Object Detection', wait)
+
+            if self._enable_visual:
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            rate.sleep()
+
+        if self._enable_visual:
+            cv2.destroyAllWindows()
+
+    def _process(self, frame, draw=False):
+        dets      = self._run_inference(frame)
+        det_str   = self._build_det_str(dets)
+        need_draw = draw or (self._pub_img is not None)
+        annotated = self._annotate(frame, dets) if need_draw else None
         try:
-            det_str = ','.join(detections) if detections else 'none'
-            self.pub_detection.publish(String(data=det_str))
+            self._pub_det.publish(String(data=det_str))
+            if self._pub_img is not None and annotated is not None:
+                self._pub_img.publish(self._bridge.cv2_to_imgmsg(annotated, encoding='bgr8'))
         except Exception as e:
-            self._log_throttled('pub_detection_error', f"Detection publish error: {e}", level='error')
-        
-        # Publish annotated image
+            rospy.logwarn_throttle(5, f"[OBJ] Erreur publication: {e}")
+        summary = self._detection_summary(dets)
+        if det_str != 'none':
+            rospy.loginfo_throttle(max(0.2, self._log_det_every_sec), f'[OBJ] {summary} | {det_str}')
+        elif self._log_none:
+            rospy.loginfo_throttle(max(0.2, self._log_det_every_sec), f'[OBJ] {summary} | none')
+        return annotated, dets
+
+    def _detection_summary(self, dets):
+        if not dets:
+            return 'lights=0 signs=0 vehicles=0'
+        n_l = sum(1 for d in dets if d['label'] in ('feu_rouge', 'feu_vert'))
+        n_s = sum(1 for d in dets if d['label'] in ('stop', 'vitesse', 'droite', 'gauche'))
+        n_v = max(0, len(dets) - n_l - n_s)
+        return f'lights={n_l} signs={n_s} vehicles={n_v}'
+
+    def _run_inference(self, frame):
+        dets = []
         try:
-            img_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding='bgr8')
-            self.pub_detection_image.publish(img_msg)
-        except CvBridgeError as e:
-            self._log_throttled('pub_image_error', f"Image publish error: {e}", level='error')
+            # Inférence avec le seuil le plus bas pour tout récupérer
+            infer_conf = min(self._conf_vehicles, self._conf_signs)
+            classes_arg = self._all_active if (self._use_class_filter and self._all_active) else None
+            if self._torch is not None:
+                with self._torch.inference_mode():
+                    results = self._model(frame, imgsz=self._infer_size,
+                                          conf=infer_conf,
+                                          classes=classes_arg, verbose=False)
+            else:
+                results = self._model(frame, imgsz=self._infer_size,
+                                      conf=infer_conf,
+                                      classes=classes_arg, verbose=False)
+
+            light_candidates = []
+            vehicle_candidates = []
+            sign_candidates = []
+
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf   = float(box.conf[0])
+                    name   = self._class_name(cls_id)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    category = self._category(cls_id, name)
+
+                    if category == 'vehicle':
+                        if conf >= self._conf_vehicles:
+                            det = self._make_det(frame, name, conf, x1, y1, x2, y2)
+                            if det is not None:
+                                vehicle_candidates.append(det)
+
+                    elif category == 'light':
+                        det = self._make_det(frame, name, conf, x1, y1, x2, y2)
+                        if det is not None:
+                            area = (det['x2'] - det['x1']) * (det['y2'] - det['y1'])
+                            if conf >= self._conf_lights and area >= self._light_min_area:
+                                light_candidates.append(det)
+
+                    elif category == 'sign':
+                        if conf >= self._conf_signs:
+                            det = self._make_det(frame, name, conf, x1, y1, x2, y2)
+                            if det is not None:
+                                w = det['x2'] - det['x1']
+                                h = det['y2'] - det['y1']
+                                area = w * h
+                                ar = (float(w) / float(h)) if h > 0 else 0.0
+
+                                # Filtres géométriques anti faux panneaux
+                                if area < self._sign_min_area:
+                                    continue
+                                if ar < self._sign_min_ar or ar > self._sign_max_ar:
+                                    continue
+
+                                # Les panneaux vitesse sont souvent les plus bruités -> seuil dédié
+                                if det['label'] == 'vitesse' and conf < self._conf_speed_signs:
+                                    continue
+                                sign_candidates.append(det)
+
+            # Garder seulement les N feux les plus confiants
+            light_candidates.sort(key=lambda d: d['conf'], reverse=True)
+            vehicle_candidates = self._deduplicate(vehicle_candidates)
+            sign_candidates = self._deduplicate(sign_candidates)
+            light_candidates = self._deduplicate(light_candidates)
+
+            vehicle_candidates.sort(key=lambda d: d['conf'], reverse=True)
+            sign_candidates.sort(key=lambda d: d['conf'], reverse=True)
+
+            dets.extend(vehicle_candidates[:max(self._max_veh_keep, 0)])
+            dets.extend(sign_candidates[:max(self._max_sign_keep, 0)])
+            dets.extend(light_candidates[:max(self._light_max_keep, 0)])
+
+            dets = self._apply_sticky(dets)
+
         except Exception as e:
-            self._log_throttled('pub_image_error', f"Image publish error: {e}", level='error')
-    
-    def _log_throttled(self, key: str, message: str, level: str = 'info') -> None:
-        """
-        Log message with throttling to prevent log spam.
-        
-        Args:
-            key (str): Unique identifier for this log message
-            message (str): Log message
-            level (str): Log level ('debug', 'info', 'warn', 'error')
-        """
-        current_time = rospy.get_time()
-        last_time = self._last_log_time.get(key, 0)
-        
-        throttle_interval = (
-            self.ERROR_LOG_THROTTLE if level == 'error'
-            else self.LOG_THROTTLE_INTERVAL
-        )
-        
-        if current_time - last_time >= throttle_interval:
-            self._last_log_time[key] = current_time
-            
-            if level == 'debug':
-                rospy.logdebug(message)
-            elif level == 'info':
-                rospy.loginfo(message)
-            elif level == 'warn':
-                rospy.logwarn(message)
-            elif level == 'error':
-                rospy.logerr(message)
-    
-    def shutdown(self) -> None:
-        """Clean up resources on shutdown"""
-        rospy.loginfo("Shutting down Object Detection Node")
-        # Release model memory
-        self.model = None
-        rospy.loginfo("✅ Object Detection Node shut down successfully")
+            rospy.logwarn_throttle(5, f'[OBJ] Inference error: {e}')
+        return dets
 
+    def _iou(self, a, b):
+        ax1, ay1, ax2, ay2 = a['x1'], a['y1'], a['x2'], a['y2']
+        bx1, by1, bx2, by2 = b['x1'], b['y1'], b['x2'], b['y2']
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        union = area_a + area_b - inter
+        return float(inter) / float(max(1, union))
 
-# ============================================================================
-# Main
-# ============================================================================
+    def _deduplicate(self, dets):
+        """Supprime les boites quasi identiques par label en gardant la plus confiante."""
+        if not dets:
+            return dets
+        kept = []
+        for d in sorted(dets, key=lambda x: x['conf'], reverse=True):
+            duplicate = False
+            for k in kept:
+                if d['label'] != k['label']:
+                    continue
+                if self._iou(d, k) >= self._dedup_iou_thresh:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(d)
+        return kept
 
-def main():
-    """Main entry point"""
-    try:
-        node = ObjectDetectionNode()
-        rospy.on_shutdown(node.shutdown)
-        rospy.spin()
-    except KeyboardInterrupt:
-        rospy.loginfo("Interrupted by user")
-    except Exception as e:
-        rospy.logerr(f"Fatal error: {e}")
-        raise
+    def _apply_sticky(self, dets):
+        """Maintien court des détections critiques pour lisser le flicker."""
+        now = time.time()
+        sticky_labels = {'feu_rouge', 'feu_vert', 'stop', 'droite', 'gauche', 'vitesse'}
+
+        live_labels = set()
+        for d in dets:
+            label = d['label']
+            if label in sticky_labels:
+                live_labels.add(label)
+                self._sticky_det[label] = d
+                self._sticky_until[label] = now + max(0.0, self._sticky_hold_sec)
+
+        for label in list(self._sticky_until.keys()):
+            if self._sticky_until.get(label, 0.0) < now:
+                self._sticky_until.pop(label, None)
+                self._sticky_det.pop(label, None)
+
+        for label, expiry in self._sticky_until.items():
+            if label in live_labels:
+                continue
+            if expiry >= now and label in self._sticky_det:
+                cached = dict(self._sticky_det[label])
+                cached['conf'] = min(float(cached.get('conf', 0.0)), 0.99)
+                dets.append(cached)
+
+        return dets
+
+    def _make_det(self, frame, name, conf, x1, y1, x2, y2):
+        h, w = frame.shape[:2]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w - 1))
+        y2 = max(0, min(y2, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        raw_label = LABEL_MAP.get(name.lower(), name.lower())
+        detail    = 'none'
+        if raw_label == 'feu_rouge':
+            detail = 'rouge'
+        elif raw_label == 'feu_vert':
+            detail = 'vert'
+        elif raw_label == 'stop':
+            detail = 'stop'
+        elif raw_label == 'vitesse':
+            # Conserver la valeur du panneau (ex: speed limit 50 -> detail=50)
+            parts = name.lower().split()
+            if parts and parts[-1].isdigit():
+                detail = parts[-1]
+        elif raw_label == 'droite':
+            detail = 'droite'
+        elif raw_label == 'gauche':
+            detail = 'gauche'
+        return {'label': raw_label, 'detail': detail,
+                'conf': conf, 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+
+    def _build_det_str(self, dets):
+        if not dets:
+            return 'none'
+        return '|'.join(
+            f"{d['label']}:{d['detail']}:{d['conf']:.2f}"
+            f":{d['x1']}:{d['y1']}:{d['x2']}:{d['y2']}"
+            for d in dets)
+
+    def _annotate(self, frame, dets):
+        out = frame.copy()
+        for d in dets:
+            label  = d['label']
+            detail = d['detail']
+            conf   = d['conf']
+            x1, y1, x2, y2 = d['x1'], d['y1'], d['x2'], d['y2']
+            color = BOX_COLORS.get(label, BOX_COLORS['default'])
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            if detail not in ('none', ''):
+                txt = f'{label.upper()} [{detail}] {conf:.0%}'
+            else:
+                txt = f'{label.upper()} {conf:.0%}'
+            font      = cv2.FONT_HERSHEY_SIMPLEX
+            scale     = 0.50
+            thickness = 1
+            tw, th    = cv2.getTextSize(txt, font, scale, thickness)[0]
+            ty        = max(y1 - 4, th + 2)
+            cv2.rectangle(out, (x1, ty - th - 4), (x1 + tw + 4, ty + 2), color, -1)
+            cv2.putText(out, txt, (x1 + 2, ty - 2), font, scale,
+                        (255, 255, 255), thickness)
+        return out
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        node = ObjectDetectionNode()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
