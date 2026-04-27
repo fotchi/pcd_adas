@@ -33,11 +33,11 @@ INFER_SIZE = 640
 
 # Seuils par catégorie
 CONF_VEHICLES = 0.05   # un peu plus sensible pour récupérer car/pieton
-CONF_LIGHTS   = 0.10   # très sensible pour récupérer les feux CARLA
+CONF_LIGHTS   = 0.25   # plus sensible pour récupérer les feux CARLA
 CONF_SIGNS    = 0.06   # panneaux stop/vitesse
 CONF_SPEED_SIGNS = 0.30  # plus strict pour limiter les faux panneaux vitesse
 
-LIGHT_MIN_AREA = 50    # px² — très permissif pour feux lointains ou petits
+LIGHT_MIN_AREA = 140   # px² — plus permissif pour feux lointains
 LIGHT_MAX_KEEP = 3     # max N feux par frame
 SIGN_MIN_AREA  = 450   # px² — filtre des petits faux positifs
 SIGN_MIN_AR    = 0.65  # ratio w/h minimal attendu
