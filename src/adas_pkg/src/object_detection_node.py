@@ -33,11 +33,11 @@ INFER_SIZE = 640
 
 # Seuils par catégorie
 CONF_VEHICLES = 0.05   # un peu plus sensible pour récupérer car/pieton
-CONF_LIGHTS   = 0.25   # plus sensible pour récupérer les feux CARLA
+CONF_LIGHTS   = 0.10   # très sensible pour récupérer les feux CARLA
 CONF_SIGNS    = 0.06   # panneaux stop/vitesse
 CONF_SPEED_SIGNS = 0.30  # plus strict pour limiter les faux panneaux vitesse
 
-LIGHT_MIN_AREA = 140   # px² — plus permissif pour feux lointains
+LIGHT_MIN_AREA = 50    # px² — très permissif pour feux lointains ou petits
 LIGHT_MAX_KEEP = 3     # max N feux par frame
 SIGN_MIN_AREA  = 450   # px² — filtre des petits faux positifs
 SIGN_MIN_AR    = 0.65  # ratio w/h minimal attendu
@@ -341,6 +341,15 @@ class ObjectDetectionNode:
 
     def _process(self, frame, draw=False):
         dets      = self._run_inference(frame)
+        
+        # ── Détection feu par couleur en backup ────────────────────────────
+        # Si aucun feu détecté par le modèle, chercher par couleur
+        has_light = any(d['label'] in ('feu_rouge', 'feu_vert') for d in dets)
+        if not has_light:
+            color_light = self._detect_light_by_color(frame)
+            if color_light is not None:
+                dets.append(color_light)
+        
         det_str   = self._build_det_str(dets)
         need_draw = draw or (self._pub_img is not None)
         annotated = self._annotate(frame, dets) if need_draw else None
@@ -356,6 +365,69 @@ class ObjectDetectionNode:
         elif self._log_none:
             rospy.loginfo_throttle(max(0.2, self._log_det_every_sec), f'[OBJ] {summary} | none')
         return annotated, dets
+
+    def _detect_light_by_color(self, frame):
+        """
+        Détecte les feux tricolores par couleur en backup du modèle.
+        Cherche dans le tiers supérieur de l'image (zone des feux).
+        Retourne un détail si rouge/vert trouvé, sinon None.
+        """
+        try:
+            h, w = frame.shape[:2]
+            roi_h = max(1, h // 3)  # Région supérieure
+            roi = frame[0:roi_h, :, :]
+            
+            # Convertir en HSV pour meilleure détection couleur
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            
+            # Plages de teinte pour rouge et vert en HSV
+            # Rouge : 0-10 et 170-180 (circulaire)
+            # Vert : 35-85
+            
+            red_low1 = np.array([0, 100, 100])
+            red_high1 = np.array([10, 255, 255])
+            red_low2 = np.array([170, 100, 100])
+            red_high2 = np.array([180, 255, 255])
+            
+            green_low = np.array([35, 100, 100])
+            green_high = np.array([85, 255, 255])
+            
+            mask_red = cv2.inRange(hsv, red_low1, red_high1) | cv2.inRange(hsv, red_low2, red_high2)
+            mask_green = cv2.inRange(hsv, green_low, green_high)
+            
+            # Compter pixels pour déterminer couleur dominante
+            red_cnt = cv2.countNonZero(mask_red)
+            green_cnt = cv2.countNonZero(mask_green)
+            
+            # Seuil minimum de pixels (au moins 200 pixels détectés)
+            threshold = 200
+            
+            if red_cnt > threshold and red_cnt > green_cnt:
+                # Feu rouge détecté
+                return {
+                    'label': 'feu_rouge',
+                    'detail': 'rouge',
+                    'conf': 0.65,
+                    'x1': w // 4,
+                    'y1': 10,
+                    'x2': 3 * w // 4,
+                    'y2': roi_h - 10
+                }
+            elif green_cnt > threshold and green_cnt > red_cnt:
+                # Feu vert détecté
+                return {
+                    'label': 'feu_vert',
+                    'detail': 'vert',
+                    'conf': 0.65,
+                    'x1': w // 4,
+                    'y1': 10,
+                    'x2': 3 * w // 4,
+                    'y2': roi_h - 10
+                }
+        except Exception as e:
+            rospy.logwarn_throttle(5, f'[OBJ] Erreur détection couleur: {e}')
+        
+        return None
 
     def _detection_summary(self, dets):
         if not dets:
