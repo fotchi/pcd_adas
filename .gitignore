@@ -25,7 +25,6 @@ Thumbs.db
 # Model weights (except best-11.pt)
 *.pth
 *.weights
-yolov8n.pt
 best_model*.pt
 
 
