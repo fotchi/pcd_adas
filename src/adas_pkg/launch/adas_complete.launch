@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <!--
+    ADAS Pipeline — nœuds ROS uniquement
+    carla_adas_world.py doit être lancé SÉPARÉMENT avant ce fichier.
+
+    Ordre de lancement :
+      1.  ./CarlaUE4.sh
+      2.  python3 ~/carla_adas_world.py
+      3.  roslaunch adas_pkg adas_complete.launch   ← CE FICHIER
+
+    Flux :
+      /carla/camera/rgb  →  lane_detection  →  /lane/status + /lane/deviation
+      /lane/*  +  /carla/radar/front  +  /carla/speed  →  decision  →  /adas/control
+      /adas/control  →  carla_adas_world.py  →  VehicleControl CARLA
+  -->
+
+  <!-- Détection de voies + fenêtre OpenCV -->
+  <node pkg="adas_pkg"
+        type="lane_viewer_node.py"
+        name="lane_detection"
+        output="screen"
+        respawn="true"
+      respawn_delay="2"/>
+
+    <!-- Radar CARLA -> distance minimale -->
+    <node pkg="adas_pkg"
+      type="radar_bridge_node.py"
+      name="radar_bridge"
+      output="screen"
+      respawn="true"
+      respawn_delay="2"/>
+
+  <!-- Détection d'objets / panneaux / feux -->
+  <node pkg="adas_pkg"
+        type="object_detection_node.py"
+        name="object_detection"
+        output="screen"
+        respawn="true"
+        respawn_delay="2">
+    <param name="model_coco_path" value="$(find adas_pkg)/src/yolov8n.pt"/>
+  </node>
+
+
+  <!-- Décision : radar + voie → commande -->
+  <node pkg="adas_pkg"
+        type="decision_node.py"
+        name="decision"
+        output="screen"
+        respawn="true"
+        respawn_delay="2"/>
+
+</launch>

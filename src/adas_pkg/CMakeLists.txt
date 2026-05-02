@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(adas_pkg)
+find_package(catkin REQUIRED COMPONENTS rospy sensor_msgs std_msgs cv_bridge)
+catkin_package(CATKIN_DEPENDS rospy sensor_msgs std_msgs cv_bridge)
+install(DIRECTORY src/ DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})

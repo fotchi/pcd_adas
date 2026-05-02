@@ -1,0 +1,37 @@
+# Catkin build and development directories
+build/
+devel/
+install/
+.claude/
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+*.egg
+dist/
+
+# IDE
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights
+*.pt
+*.pth
+*.weights
+
+
+
+
+
+
+
+
+
