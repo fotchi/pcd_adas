@@ -2,7 +2,7 @@
 build/
 devel/
 install/
-.claude/
+
 # Python
 *.pyc
 __pycache__/
@@ -12,7 +12,7 @@ dist/
 
 # IDE
 .vscode/
-.claude/
+
 .idea/
 *.swp
 *.swo
