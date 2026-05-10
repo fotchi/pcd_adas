@@ -1,0 +1,11 @@
+## Datasets utilisés
+
+Les datasets suivants ont été utilisés pour l’entraînement, la validation et les tests du système de détection et d’analyse de scènes routières.
+
+| Dataset | Utilisation |
+| Traffic Violation Dataset | Scènes routières réelles et situations de circulation |
+    --!link : https://www.kaggle.com/datasets/guisahanes/traffic-violation-detection-dataset
+| COCO128 | Enrichissement avec des objets génériques comme les personnes et les véhicules |
+| Données CARLA | Tests et validation dans un environnement simulé |
+    --!link : https://app.roboflow.com/crns/carla-object-detection-nlo1t-pailr/browse?queryText=&pageSize=50&startingIndex=0&browseQuery=true
+    
